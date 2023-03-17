@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
+import json
 from json import dumps
 from kafka import KafkaProducer
 
@@ -25,8 +26,14 @@ class Data(BaseModel):
 @app.post("/pin/")
 def get_db_row(item: Data):
     data = dict(item)
-    return item
+    producer = KafkaProducer(bootstrap_servers='localhost:9092', value_serializer=lambda m: json.dumps(m).encode('ascii'))
+    future = producer.send('PinterestTopic1', data)
+    record_metadata = future.get(timeout=10)
+    # Successful result returns assigned partition and offset
+    print (record_metadata.topic)
+    print (record_metadata.partition)
+    print (record_metadata.offset)
 
 
 if __name__ == '__main__':
-    uvicorn.run("project_pin_API:app", host="localhost", port=8000)
+    uvicorn.run("project_pin_API:app", host="localhost", port=8001)
