@@ -6,12 +6,14 @@ from pyspark.sql.types import StructType, StructField, StringType, IntegerType, 
 import json
 import os
 import pyspark
+import sys
 import yaml
 
 topic = 'PinterestTopic1'
 #streaming_topic = 'PinterestStreamingTopic'
 bootstrap_servers = 'localhost:9092'
 value_deserializer = lambda m: json.loads(m)
+jdbc_config = "/Users/agc/AiCore/pinterest-data-pipeline/jdbc_config.yaml"
 
 streaming_consumer = KafkaConsumer(topic, 
                                bootstrap_servers=bootstrap_servers, 
@@ -68,8 +70,9 @@ streaming_df = streaming_df.withColumn("follower_count", streaming_df.follower_c
 
 streaming_df_preprocessed = streaming_df.dropna("all", subset=["title", "description", "follower_count"])
 
-# work out number of posts made for each category in each time window
-# streaming_df_preprocessed_category_count = streaming_df_preprocessed.withWatermark("timestamp", "1 minute").groupBy("category", window("timestamp", "1 minute")).count()
+# work out number of posts made for each category
+streaming_df_preprocessed_category_count = streaming_df_preprocessed.withWatermark("timestamp", "2 minutes") \
+                                                                        .groupBy("category").count()
 
 # work out mean number of followers per category in each time window (rounded to an integer) and then return the category that has the highest mean
 streaming_df_preprocessed_mean_followers_per_category = streaming_df_preprocessed \
@@ -87,11 +90,7 @@ streaming_df_preprocessed_category_count.writeStream \
     .start() \
     .awaitTermination()
 """
-def write_total_num_posts_per_category_to_postgres(df):
-     pass
 
-
-jdbc_config = "/Users/agc/AiCore/pinterest-data-pipeline/jdbc_config.yaml"
 with open(jdbc_config, "r") as f:
         jdbc_creds = yaml.safe_load(f)
 
@@ -101,33 +100,57 @@ jdbc_database = jdbc_creds["JDBC_DATABASE"]
 jdbc_username = jdbc_creds["JDBC_USER"]
 jdbc_password = jdbc_creds["JDBC_PASSWORD"]
 jdbc_url = f"jdbc:postgresql://{jdbc_host}:{jdbc_port}/{jdbc_database}"
+connection_properties = {"user": jdbc_username, "password": jdbc_password, "driver": "org.postgresql.Driver"}
 
 
 def write_to_postgres(df, batchId):
-    connection_properties = {
-        "user": jdbc_username,
-        "password": jdbc_password,
-        "driver": "org.postgresql.Driver"
-    }
     df.write \
         .mode("append") \
         .jdbc(url=jdbc_url, table=jdbc_table, properties=connection_properties)
 
 
-def write_pins_to_postgres(df):
+def write_total_num_posts_per_category_to_postgres(df, batchId):
+    df.write \
+        .mode("overwrite") \
+        .jdbc(url=jdbc_url, table=jdbc_table, properties=connection_properties)
+
+
+def write_pins_to_postgres(df, mode_function):
     df.writeStream \
-        .foreachBatch(write_to_postgres) \
+        .foreachBatch(mode_function) \
         .option("truncate", "true") \
         .start() \
         .awaitTermination()
 
+def write_category_popularity_to_postgres(df, mode_function):
+    df.writeStream \
+        .foreachBatch(mode_function) \
+        .outputMode("complete") \
+        .option("truncate", "true") \
+        .start() \
+        .awaitTermination()
 
-# streaming_df_preprocessed.writeStream \
-#     .format("console") \
-#     .outputMode("append") \
-#     .option("truncate", "true") \
-#     .start() \
-#     .awaitTermination()
+if sys.argv[1] == "category-popularity":
+    jdbc_table = "category_popularity" # defines table to write to in postgres db
+    write_category_popularity_to_postgres(streaming_df_preprocessed_category_count, write_total_num_posts_per_category_to_postgres)
 
-jdbc_table = "mean_followers_per_category" # defines table to write to in postgres db
-write_pins_to_postgres(streaming_df_preprocessed_mean_followers_per_category)
+elif sys.argv[1] == "max-mean-followers":
+    jdbc_table = "mean_followers_per_category" # defines table to write to in postgres db
+    write_pins_to_postgres(streaming_df_preprocessed_mean_followers_per_category, write_to_postgres)
+
+elif sys.argv[1] == "posts":
+    jdbc_table = "pinterest_posts" # defines table to write to in postgres db
+    write_pins_to_postgres(streaming_df_preprocessed, write_to_postgres)
+
+elif sys.argv[1] == "print-to-console":
+    streaming_df_preprocessed_category_count.writeStream \
+    .format("console") \
+    .outputMode("complete") \
+    .option("truncate", "true") \
+    .start() \
+    .awaitTermination()
+
+else:
+     print("Invalid option. sys.argv[1] can be 1 of 3 options: posts, category-popularity or max-mean-followers")
+     
+     
