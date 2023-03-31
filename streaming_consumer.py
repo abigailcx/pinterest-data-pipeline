@@ -3,13 +3,9 @@ from kafka import KafkaConsumer
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, LongType
-
-from pyspark.streaming import StreamingContext
-
 import json
 import os
 import pyspark
-import psycopg2
 import yaml
 
 topic = 'PinterestTopic1'
@@ -21,16 +17,6 @@ streaming_consumer = KafkaConsumer(topic,
                                bootstrap_servers=bootstrap_servers, 
                                value_deserializer=value_deserializer)
 
-# for message in streaming_consumer:
-#     print(message.topic)
-#     print(message.key)
-#     print(message.value)
-
-
-# consume data from kafka to spark streaming
-# submit spark streaming JAR file to your pyspark submit arguments (check Kafka Spark integration notebook)
-# pyspark submit args is in data_processing.py
-#
 # Download spark streaming package from Maven repository and submit to PySpark at runtime. 
 os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2,org.postgresql:postgresql:42.6.0 pyspark-shell'
 spark_conf = pyspark.SparkConf().setMaster("local[*]").setAppName("spark_streaming")
@@ -63,9 +49,9 @@ streaming_df = spark.readStream.format("kafka") \
         .load()
 
 # get only the pinterest post itself, which is in the "value" column of the streaming_df and cast to string
-streaming_df = streaming_df.selectExpr("CAST(value as STRING)")
+streaming_df = streaming_df.selectExpr("CAST(value as STRING)", "timestamp AS timestamp")
 # turn the "value" column into a json object using defined json schema and change the name to "pinterest_posts". Only select that one column containing the pinterest posts
-streaming_df = streaming_df.select(from_json(col("value"), json_schema).alias("pinterest_posts")).select("pinterest_posts.*")
+streaming_df = streaming_df.select(from_json(col("value"), json_schema).alias("pinterest_posts"), col("timestamp")).select("pinterest_posts.*", "timestamp")
 # streaming_df = streaming_df.withColumn("timestamp", current_timestamp())
 streaming_df = streaming_df.withColumn("follower_count", when(streaming_df.follower_count.endswith("k"),regexp_replace(streaming_df.follower_count,"k","000")) \
                                             .when(streaming_df.follower_count.endswith("M"),regexp_replace(streaming_df.follower_count,"M","000000")) \
@@ -82,16 +68,28 @@ streaming_df = streaming_df.withColumn("follower_count", streaming_df.follower_c
 
 streaming_df_preprocessed = streaming_df.dropna("all", subset=["title", "description", "follower_count"])
 
-# streaming_df_preprocessed_category_count = streaming_df_preprocessed.groupBy("category").count()
-# streaming_df_preprocessed_mean_followers_per_category = streaming_df_preprocessed.groupBy("category").agg(round(mean("follower_count")).alias("mean_follower_count"))
+# work out number of posts made for each category in each time window
+# streaming_df_preprocessed_category_count = streaming_df_preprocessed.withWatermark("timestamp", "1 minute").groupBy("category", window("timestamp", "1 minute")).count()
 
+# work out mean number of followers per category in each time window (rounded to an integer) and then return the category that has the highest mean
+streaming_df_preprocessed_mean_followers_per_category = streaming_df_preprocessed \
+    .withWatermark("timestamp", "5 minutes") \
+    .groupBy("category", window("timestamp", "30 minutes")) \
+    .agg(round(mean("follower_count")), max("follower_count").alias("mean_follower_count")) \
+    .select("category", "mean_follower_count")
+
+"""
 # output the messages to the console 
-# streaming_df_preprocessed_category_count.writeStream \
-#     .format("console") \
-#     .outputMode("complete") \
-#     .option("truncate", "true") \
-#     .start() \
-#     .awaitTermination()
+streaming_df_preprocessed_category_count.writeStream \
+    .format("console") \
+    .outputMode("append") \
+    .option("truncate", "true") \
+    .start() \
+    .awaitTermination()
+"""
+def write_total_num_posts_per_category_to_postgres(df):
+     pass
+
 
 jdbc_config = "/Users/agc/AiCore/pinterest-data-pipeline/jdbc_config.yaml"
 with open(jdbc_config, "r") as f:
@@ -103,27 +101,26 @@ jdbc_database = jdbc_creds["JDBC_DATABASE"]
 jdbc_username = jdbc_creds["JDBC_USER"]
 jdbc_password = jdbc_creds["JDBC_PASSWORD"]
 jdbc_url = f"jdbc:postgresql://{jdbc_host}:{jdbc_port}/{jdbc_database}"
-jdbc_table = "pinterest_posts" # defines table to write to in postgres db
 
 
-def write_to_postgres(df, batchID):
+def write_to_postgres(df, batchId):
     connection_properties = {
         "user": jdbc_username,
         "password": jdbc_password,
         "driver": "org.postgresql.Driver"
     }
-
     df.write \
         .mode("append") \
         .jdbc(url=jdbc_url, table=jdbc_table, properties=connection_properties)
 
 
+def write_pins_to_postgres(df):
+    df.writeStream \
+        .foreachBatch(write_to_postgres) \
+        .option("truncate", "true") \
+        .start() \
+        .awaitTermination()
 
-streaming_df_preprocessed.writeStream \
-    .foreachBatch(write_to_postgres) \
-    .option("truncate", "true") \
-    .start() \
-    .awaitTermination()
 
 # streaming_df_preprocessed.writeStream \
 #     .format("console") \
@@ -131,3 +128,6 @@ streaming_df_preprocessed.writeStream \
 #     .option("truncate", "true") \
 #     .start() \
 #     .awaitTermination()
+
+jdbc_table = "mean_followers_per_category" # defines table to write to in postgres db
+write_pins_to_postgres(streaming_df_preprocessed_mean_followers_per_category)
