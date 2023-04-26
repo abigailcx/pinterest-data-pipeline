@@ -1,0 +1,10 @@
+boto3==1.26.95
+fastapi==0.95.1
+kafka_python==2.0.2
+pydantic==1.10.6
+pyspark==3.3.2
+PyYAML==6.0
+PyYAML==6.0
+Requests==2.29.0
+SQLAlchemy==1.4.46
+uvicorn==0.21.1
